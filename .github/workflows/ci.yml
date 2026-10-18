@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-release:
+    name: Build Arch Linux Release
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel clang dbus fontconfig libx11 libxcursor libxi \
+            libxkbcommon libxrandr pkgconf rust wayland
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ie-r-archlinux-x86_64
+          path: target/release/ie-r
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ie-r-archlinux-x86_64
+          path: dist
+
+      - name: Name release asset
+        run: mv dist/ie-r dist/ie-r-archlinux-x86_64
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ie-r-archlinux-x86_64
+          generate_release_notes: true
