@@ -15,6 +15,26 @@ use crate::core::terminal::{log_info, log_error, Styled};
 
 use super::{IEWaylandState, IEOverlay, AboutSurface, OverlaySurface};
 
+fn set_xrgb_unused_bits_opaque(pixels: &mut [u32]) {
+    for pixel in pixels {
+        *pixel |= 0xff00_0000;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::set_xrgb_unused_bits_opaque;
+
+    #[test]
+    fn xrgb_shm_pixels_have_opaque_unused_bits() {
+        let mut pixels = [0x0012_3456, 0x7f89_abcd, 0xff00_0000];
+
+        set_xrgb_unused_bits_opaque(&mut pixels);
+
+        assert_eq!(pixels, [0xff12_3456, 0xff89_abcd, 0xff00_0000]);
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Overlay lifecycle and render loop.
 //
@@ -199,6 +219,14 @@ impl IEWaylandState {
                 // Inactive overlay with clean dirty state — already showing background, skip.
                 // Only render if there are dirty regions (need to erase the old magnifier).
                 if !is_active && self.overlays[overlay_idx].dirty_rects.is_empty() {
+                    if self.overlays[overlay_idx].buffers.is_empty()
+                        && crate::core::terminal::info_visible()
+                    {
+                        log_info(&format!(
+                            "Skipping first buffer for inactive overlay {}",
+                            overlay_idx
+                        ));
+                    }
                     continue;
                 }
 
@@ -211,6 +239,16 @@ impl IEWaylandState {
                 let tile = &app.canvas.tiles[tile_idx];
                 let buf_w = tile.capture.width;
                 let buf_h = tile.capture.height;
+                let first_buffer = self.overlays[overlay_idx].buffers.is_empty();
+                let sample_count = 64usize;
+                let background_nonblack = if first_buffer && crate::core::terminal::info_visible() {
+                    (0..sample_count)
+                        .filter_map(|i| tile.capture.xrgb_buffer.get(i * tile.capture.xrgb_buffer.len() / sample_count))
+                        .filter(|&&pixel| pixel & 0x00ff_ffff != 0)
+                        .count()
+                } else {
+                    0
+                };
                 let stride = buf_w as i32 * 4;
 
                 let (buffer, canvas) = match pool.create_buffer(
@@ -310,6 +348,32 @@ impl IEWaylandState {
 
                     // Swap dirty_rects back into the overlay (for the next frame).
                     std::mem::swap(&mut app.dirty_rects, &mut self.overlays[overlay_idx].dirty_rects);
+                }
+
+                set_xrgb_unused_bits_opaque(canvas_u32);
+
+                if first_buffer && crate::core::terminal::info_visible() {
+                    let rendered_nonblack = (0..sample_count)
+                        .filter_map(|i| canvas_u32.get(i * canvas_u32.len() / sample_count))
+                        .filter(|&&pixel| pixel & 0x00ff_ffff != 0)
+                        .count();
+                    let rendered_opaque = (0..sample_count)
+                        .filter_map(|i| canvas_u32.get(i * canvas_u32.len() / sample_count))
+                        .filter(|&&pixel| pixel & 0xff00_0000 == 0xff00_0000)
+                        .count();
+                    log_info(&format!(
+                        "First SHM buffer overlay={} active={} tile={} align_prefix={} source_nonblack={}/{} buffer_nonblack={}/{} opaque_x={}/{}",
+                        overlay_idx,
+                        is_active,
+                        tile_idx,
+                        prefix.len(),
+                        background_nonblack,
+                        sample_count,
+                        rendered_nonblack,
+                        sample_count,
+                        rendered_opaque,
+                        sample_count,
+                    ));
                 }
 
                 // --- Phase 4: Wayland commit ---
@@ -463,6 +527,7 @@ impl IEWaylandState {
             &mut about.blur_buf_2,
             20, // Fixed blur radius for About window
         );
+        set_xrgb_unused_bits_opaque(canvas_u32);
 
         // Blur is cached in AboutApp after the first frame — scratchpads no longer needed (~4.8MB).
         if !about.blur_buf_1.is_empty() {

@@ -5,7 +5,8 @@
 //   capture_output_dbus(conn, name) — capture a specific monitor by name.
 //   capture_screen_dbus(conn)       — capture the active screen (single-tile fallback).
 //
-// Protocol: SCM_RIGHTS passes fd to KWin, which writes raw XRGB directly into it.
+// Protocol: SCM_RIGHTS passes fd to KWin, which writes raw QImage pixels;
+// the reply's format and stride metadata define their layout.
 // Authorization: silent → interactive retry on NoAuthorized.
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -120,11 +121,18 @@ fn perform_kwin_capture(
         .get("type")
         .and_then(|v| <&str>::try_from(v).ok())
         .unwrap_or("unknown");
+    let raw_format = metadata.get("format").and_then(|v| u32::try_from(v).ok());
+    let raw_stride = metadata.get("stride").and_then(|v| u32::try_from(v).ok());
 
     if width == 0 || height == 0 {
         return Err(anyhow!("KWin capture: invalid dimensions {}x{}", width, height));
     }
-    let expected_size = width as u64 * height as u64 * 4;
+    let expected_size = if reply_type == "raw" {
+        raw_stride.ok_or_else(|| anyhow!("KWin raw capture omitted stride metadata"))? as u64
+            * height as u64
+    } else {
+        width as u64 * height as u64 * 4
+    };
     // Pre-allocate: we know the exact size (14MB for 2560×1440).
     // Without this, Vec grows through 3-4 reallocs (0→4K→32K→...→14MB).
     let mut bytes = Vec::with_capacity(expected_size as usize);
@@ -161,25 +169,24 @@ fn perform_kwin_capture(
 
     if reply_type == "raw" && width > 0 && height > 0 {
         if bytes.len() >= expected_size as usize {
-            let num_pixels = (width * height) as usize;
-            bytes.truncate(num_pixels * 4);
-
-            // Safe conversion Vec<u8> → Vec<u32>
-            // try_cast_vec: zero-copy if allocator returned an aligned pointer (usually yes).
-            // Fallback: copy via from_ne_bytes (if alignment didn't match).
-            let xrgb: Vec<u32> = match bytemuck::try_cast_vec(bytes) {
-                Ok(v) => v,
-                Err((_err, bytes)) => bytes
-                    .chunks_exact(4)
-                    .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect(),
-            };
-            log_step("Capture", &format!("Total: {}ms ({}x{}, type={})", t0.elapsed().as_millis(), width, height, reply_type));
-            return Ok(ScreenCapture {
-                xrgb_buffer: xrgb,
-                width,
-                height,
-            });
+            let format = raw_format
+                .ok_or_else(|| anyhow!("KWin raw capture omitted QImage format metadata"))?;
+            let stride = raw_stride.unwrap();
+            bytes.truncate(expected_size as usize);
+            let capture = decode_raw_qimage(&bytes, width, height, stride, format)?;
+            log_step(
+                "Capture",
+                &format!(
+                    "Total: {}ms ({}x{}, type={}, format={}, stride={})",
+                    t0.elapsed().as_millis(),
+                    width,
+                    height,
+                    reply_type,
+                    format,
+                    stride
+                ),
+            );
+            return Ok(capture);
         } else {
             log_warn(&format!("Raw capture size mismatch: expected >= {}, got {}", expected_size, bytes.len()));
         }
@@ -188,4 +195,110 @@ fn perform_kwin_capture(
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
     let dyn_img = reader.decode()?;
     Ok(rgba_to_capture(&dyn_img.to_rgba8()))
+}
+
+fn decode_raw_qimage(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: u32,
+) -> Result<ScreenCapture> {
+    const RGB32: u32 = 4;
+    const ARGB32: u32 = 5;
+    const ARGB32_PREMULTIPLIED: u32 = 6;
+    const RGBX8888: u32 = 16;
+    const RGBA8888: u32 = 17;
+    const RGBA8888_PREMULTIPLIED: u32 = 18;
+
+    if !matches!(
+        format,
+        RGB32 | ARGB32 | ARGB32_PREMULTIPLIED | RGBX8888 | RGBA8888 | RGBA8888_PREMULTIPLIED
+    ) {
+        anyhow::bail!("unsupported KWin raw QImage format {format}");
+    }
+
+    let row_bytes = (width as usize)
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("KWin raw capture row size overflow"))?;
+    if (stride as usize) < row_bytes {
+        anyhow::bail!("KWin raw capture stride {stride} is smaller than row size {row_bytes}");
+    }
+    let required_size = (stride as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| anyhow!("KWin raw capture size overflow"))?;
+    if bytes.len() < required_size {
+        anyhow::bail!(
+            "KWin raw capture is truncated: expected {required_size} bytes, got {}",
+            bytes.len()
+        );
+    }
+
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| anyhow!("KWin raw capture pixel count overflow"))?;
+    let mut xrgb_buffer = Vec::with_capacity(pixel_count);
+
+    for y in 0..height as usize {
+        let start = y * stride as usize;
+        for pixel in bytes[start..start + row_bytes].chunks_exact(4) {
+            let (mut red, mut green, mut blue, alpha) = match format {
+                RGB32 | ARGB32 | ARGB32_PREMULTIPLIED => {
+                    let value = u32::from_ne_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
+                    (
+                        ((value >> 16) & 0xff) as u8,
+                        ((value >> 8) & 0xff) as u8,
+                        (value & 0xff) as u8,
+                        (value >> 24) as u8,
+                    )
+                }
+                RGBX8888 => (pixel[0], pixel[1], pixel[2], 0xff),
+                RGBA8888 | RGBA8888_PREMULTIPLIED => (pixel[0], pixel[1], pixel[2], pixel[3]),
+                _ => unreachable!(),
+            };
+
+            if matches!(format, ARGB32_PREMULTIPLIED | RGBA8888_PREMULTIPLIED)
+                && alpha != 0
+                && alpha != 0xff
+            {
+                red = ((red as u32 * 0xff + alpha as u32 / 2) / alpha as u32).min(0xff) as u8;
+                green = ((green as u32 * 0xff + alpha as u32 / 2) / alpha as u32).min(0xff) as u8;
+                blue = ((blue as u32 * 0xff + alpha as u32 / 2) / alpha as u32).min(0xff) as u8;
+            }
+
+            xrgb_buffer.push(((red as u32) << 16) | ((green as u32) << 8) | blue as u32);
+        }
+    }
+
+    Ok(ScreenCapture {
+        xrgb_buffer,
+        width,
+        height,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_raw_qimage;
+
+    #[test]
+    fn decodes_rgbx8888_channels_and_row_stride() {
+        let bytes = [
+            0x12, 0x34, 0x56, 0xff, 0xaa, 0xaa, 0xaa, 0xaa, 0xa0, 0xb0, 0xc0, 0xff, 0xbb, 0xbb,
+            0xbb, 0xbb,
+        ];
+
+        let capture = decode_raw_qimage(&bytes, 1, 2, 8, 16).unwrap();
+
+        assert_eq!(capture.xrgb_buffer, vec![0x123456, 0xa0b0c0]);
+    }
+
+    #[test]
+    fn decodes_legacy_argb32_premultiplied_words() {
+        let bytes = 0xff12_3456u32.to_ne_bytes();
+
+        let capture = decode_raw_qimage(&bytes, 1, 1, 4, 6).unwrap();
+
+        assert_eq!(capture.xrgb_buffer, vec![0x123456]);
+    }
 }
